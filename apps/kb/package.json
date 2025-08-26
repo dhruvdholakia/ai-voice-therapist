@@ -1,0 +1,22 @@
+{
+  "name": "@starter/kb",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@fastify/cors": "^8.5.0",
+    "@qdrant/js-client-rest": "^1.15.1",
+    "fastify": "^4.27.2",
+    "openai": "^4.58.1",
+    "pino": "^9.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.4"
+  }
+}
