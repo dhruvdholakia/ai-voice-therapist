@@ -188,6 +188,61 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
     return res.code(r.statusCode).send(r.json());
   }
 
+  // a) speech-update: Vapi sends chunks as user/assistant. Act on final user chunks.
+  if (type === "speech-update" && body.message) {
+    const m = body.message;
+    // Examples you might see:
+    // m.role: "user" | "assistant"
+    // m.status: "started" | "partial" | "final"
+    // m.transcript or m.artifact?.transcript?.text (shape varies by model)
+    if (m.role === "user" && (m.status === "final" || m.status === "completed")) {
+      const transcript =
+        m.transcript?.text ??
+        m.transcript ??
+        m.artifact?.transcript?.text ??
+        m.artifact?.text ??
+        "";
+      if (transcript) {
+        req.log.info({ callId, transcript }, "Final user transcript");
+        const r = await app.inject({
+          method: "POST",
+          url: "/vapi/user-input",
+          payload: { callId, transcript, intent: m.intent },
+        });
+        return res.code(r.statusCode).send(r.json());
+      }
+    }
+    // acknowledge other speech-update chunks
+    return res.send({ ok: true });
+  }
+
+  // b) transcript.partial / transcript.final (some configs use these)
+  if (type === "transcript.final" || type === "transcript.partial") {
+    const transcript = body.transcript?.text ?? body.transcript ?? "";
+    if (type === "transcript.final" && transcript) {
+      req.log.info({ callId, transcript }, "Final user transcript (legacy type)");
+      const r = await app.inject({
+        method: "POST",
+        url: "/vapi/user-input",
+        payload: { callId, transcript, intent: body.intent },
+      });
+      return res.code(r.statusCode).send(r.json());
+    }
+    return res.send({ ok: true });
+  }
+
+  // c) conversation-update (contains a rolling log). You can ignore or mine user turns.
+  if (type === "conversation-update") {
+    // Optional: scan body.message(s)/conversation for the latest user text and route on "final".
+    return res.send({ ok: true });
+  }
+
+  // d) status-update (e.g., in-progress, completed). You can just ack.
+  if (type === "status-update") {
+    return res.send({ ok: true });
+  }
+  
+
   // default: acknowledge unknown events so Vapi doesn't retry forever
   req.log.warn({ type, callId, body }, "unhandled Vapi webhook event");
   return res.send({ ok: true });
