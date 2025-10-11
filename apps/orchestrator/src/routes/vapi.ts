@@ -1,10 +1,10 @@
 import { FastifyInstance, FastifyPluginAsync } from "fastify";
-import { CFG } from "../config.js";
 import { logger, SessionState } from "@starter/shared";
-import { VapiAdapter } from "../telephony/vapi.js";
-
-
-
+import { VapiAdapter } from "../telephony/vapi";
+import { getDb } from "../db";
+import { CFG } from "../config";
+import { redactPII } from "../redact";
+import { encryptMaybe } from "../crypto";
 
 
 const sessions = new Map<string, SessionState>();
@@ -13,6 +13,65 @@ let lastEventAt: number | null = null;
 
 const KB_COOLDOWN_MS = 2 * 60_000;
 const MAX_KB_PER_CALL = 2;
+
+
+async function ensureCall(callId: string) {
+  if (!CFG.storeMetadata) return;
+  const db = await getDb();
+  await db.collection("calls").updateOne(
+    { callId },
+    { $setOnInsert: { callId, startedAt: new Date(), lang: "en", transcriptOptIn: false } },
+    { upsert: true }
+  );
+}
+
+async function saveUserUtterance(callId: string, transcript: string) {
+  if (!CFG.storeTranscripts || !transcript) return;
+
+  const db = await getDb();
+  const call = await db.collection("calls").findOne(
+    { callId },
+    { projection: { transcriptOptIn: 1 } }
+  );
+  if (!call?.transcriptOptIn) return; // only if user consented
+
+  const clean = redactPII(transcript);
+  const { ciphertext, iv, tag } = encryptMaybe(clean);
+
+  const expiresAt = new Date(Date.now() + CFG.ttlDays * 24 * 60 * 60 * 1000);
+
+  await db.collection("utterances").insertOne({
+    callId,
+    role: "user",
+    ts: new Date(),
+    expiresAt,
+    text: CFG.enc.enabled ? undefined : clean,
+    enc: CFG.enc.enabled ? { ciphertext, iv, tag } : undefined,
+    meta: { source: "vapi", lang: "en" },
+  });
+}
+
+// store assistant side too
+export async function saveAssistantUtterance(callId: string, text: string) {
+  if (!CFG.storeTranscripts || !text) return;
+  const db = await getDb();
+  const call = await db.collection("calls").findOne({ callId }, { projection: { transcriptOptIn: 1 } });
+  if (!call?.transcriptOptIn) return;
+
+  const clean = redactPII(text);
+  const { ciphertext, iv, tag } = encryptMaybe(clean);
+  const expiresAt = new Date(Date.now() + CFG.ttlDays * 24 * 60 * 60 * 1000);
+
+  await db.collection("utterances").insertOne({
+    callId,
+    role: "assistant",
+    ts: new Date(),
+    expiresAt,
+    text: CFG.enc.enabled ? undefined : clean,
+    enc: CFG.enc.enabled ? { ciphertext, iv, tag } : undefined,
+    meta: { source: "assistant", lang: "en" },
+  });
+}
 
 function allowKb(s: SessionState) {
   return s.kb_opt_in && !s.crisis &&
@@ -31,9 +90,21 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
     return true;
   };
 
+  // Call start
   app.post("/vapi/call-start", async (req, res) => {
     const body: any = req.body || {};
     const callId = body.callId || body.call_id || `call_${Date.now()}`;
+    await ensureCall(callId);
+
+    if (CFG.storeMetadata) {
+    const db = await getDb();
+    await db.collection("calls").updateOne(
+      { callId },
+      { $setOnInsert: { callId, startedAt: new Date(), lang: "en", transcriptOptIn: true } }, //for now true. on production-keep it false fr initially to optin to store user transcript
+      { upsert: true }
+    );
+  }
+
     sessions.set(callId, {
       callId,
       lang: "auto",
@@ -48,9 +119,21 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
     return res.send({ ok: true });
   });
 
+  // User input
+
   app.post("/vapi/user-input", async (req, res) => {
     const body: any = req.body || {};
-    const callId = body.callId;
+    const { callId, intent, transcript } = req.body as any;
+
+    try{
+      await saveUserUtterance(callId, transcript);
+
+    }
+    catch(e) {
+      req.log.error({ e, callId }, "Failed to store user utterance");
+    }
+
+    // const callId = body.callId;
     const s = sessions.get(callId);
     if (!s) return res.code(404).send({ ok: false, error: "session_not_found" });
 
@@ -63,6 +146,13 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
     if (typeof body.transcript === "string" &&
         /suicide|kill myself|end my life|आत्महत्या|मरना/i.test(body.transcript)) {
       s.crisis = true;
+    }
+
+    try{
+      await saveUserUtterance(callId, transcript);
+    }
+    catch(e) {
+      req.log.error({ e, callId }, "Failed to store user utterance");
     }
 
     s.turnCount += 1;
