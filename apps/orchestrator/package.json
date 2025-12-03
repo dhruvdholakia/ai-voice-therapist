@@ -1,11 +1,11 @@
 {
   "name": "@starter/orchestrator",
   "version": "0.1.0",
-  "type": "commonjs",
+  "private": true,
   "scripts": {
+    "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts",
-    "start": "node dist/index.js",
-    "build": "tsc -p tsconfig.json"
+    "start": "node dist/index.js"
   },
   "dependencies": {
     "@fastify/cors": "^8.5.0",

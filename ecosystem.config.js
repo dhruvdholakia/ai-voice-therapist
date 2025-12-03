@@ -9,7 +9,7 @@ module.exports = {
         PORT: "8080",
         HOST: "127.0.0.1",
 
-        MONGO_URI: "mongodb://localhost:27017/voice_therapist",
+        MONGO_URI: "mongodb://127.0.0.1:27017/voice_therapist",
 
         STORE_METADATA: "true",
         STORE_TRANSCRIPTS: "true",
