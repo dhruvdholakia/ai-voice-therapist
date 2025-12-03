@@ -5,10 +5,12 @@ import { getDb } from "../db";
 import { CFG } from "../config";
 import { redactPII } from "../redact";
 import { encryptMaybe } from "../crypto";
+import { CallService } from "../services/callService.js";
 
 // Sessions (ephemeral, per live call)
 const sessions = new Map<string, SessionState>();
 const vapi = new VapiAdapter({ apiKey: CFG.vapiKey });
+const callService = CallService.getInstance();
 let lastEventAt: number | null = null;
 
 const KB_COOLDOWN_MS = 2 * 60_000;
@@ -124,7 +126,7 @@ async function buildAndStoreChronologicalTranscript(callId: string) {
           role: t.role,
           // keep text if present (it will be undefined when enc enabled at utterance level)
           text: t.text ?? null,
-          // NOTE: enc is already encrypted per-utterance; we’re keeping the pointer only
+          // NOTE: enc is already encrypted per-utterance; we're keeping the pointer only
           enc: t.enc ?? null,
           ts: t.ts,
         }))
@@ -203,24 +205,26 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
   app.post("/vapi/call-start", async (req, res) => {
     const body: any = req.body || {};
     const callId = body.callId || body.call_id || `call_${Date.now()}`;
+    
+    // Extract phone numbers and other call details from Vapi webhook
+    const fromNumber = body.customer?.number || body.from || body.caller?.number;
+    const toNumber = body.phoneNumber?.number || body.to || body.assistant?.number;
+    const vapiCallId = body.id || body.vapi_call_id;
 
-    await ensureCall(callId);
-
-    if (CFG.storeMetadata) {
-      const db = await getDb();
-      await db.collection("calls").updateOne(
-        { callId },
-        {
-          $setOnInsert: {
-            callId,
-            startedAt: new Date(),
-            lang: "en",
-            transcriptOptIn: true, // keep false in prod; flip only after consent
-          },
-          $set: { startedAt: new Date() },
-        },
-        { upsert: true }
-      );
+    // Create comprehensive call record
+    try {
+      await callService.createCall({
+        callId,
+        vapiCallId,
+        fromNumber,
+        toNumber,
+        startedAt: new Date(),
+        lang: "auto", // will be updated as we detect language
+        transcriptOptIn: false, // require explicit opt-in
+      });
+    } catch (error) {
+      req.log.error({ error, callId }, "Failed to create call record");
+      // Continue anyway - don't fail the call
     }
 
     sessions.set(callId, {
@@ -249,22 +253,35 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
 
     if (!callId) return res.code(400).send({ ok: false, error: "missing_callId" });
 
-    // Ensure call doc exists even if we missed call-start
-    await ensureCall(callId);
-
-    // Session is optional; don't 404 if it’s gone
+    // Session is optional; don't 404 if it's gone
     const s = sessions.get(callId);
 
     // Update session heuristics if present
     if (s) {
-      if (intent === "opt_in_epics") s.kb_opt_in = true;
+      if (intent === "opt_in_epics") {
+        s.kb_opt_in = true;
+        // Update database record
+        await callService.updateCall(callId, { kb_opt_in: true });
+      }
+      
+      if (intent === "opt_in_transcripts") {
+        // User explicitly opts in to transcript storage
+        await callService.updateCall(callId, { transcriptOptIn: true });
+      }
 
       if (typeof transcript === "string" &&
           /suicide|kill myself|end my life|आत्महत्या|मरना/i.test(transcript)) {
         s.crisis = true;
+        // Update database with crisis flag
+        await callService.updateCall(callId, { 
+          crisis_flag: true, 
+          riskLevel: "high" 
+        });
       }
 
       s.turnCount += 1;
+      // Update turn count in database
+      await callService.updateCall(callId, { turnCount: s.turnCount });
     }
 
     // Persist the user utterance (respects consent)
@@ -286,8 +303,6 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
     const tool = body.tool;
 
     if (!callId) return res.code(400).send({ ok: false, error: "missing_callId" });
-
-    await ensureCall(callId);
 
     const s = sessions.get(callId);
     if (!s) {
@@ -311,6 +326,13 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
         const data = await r.json();
         s.kbUses += 1;
         s.lastKbMs = Date.now();
+        
+        // Update database with KB usage
+        await callService.updateCall(callId, { 
+          kb_used: true, 
+          kb_count: s.kbUses 
+        });
+        
         return res.send({ ok: true, result: data });
       } catch (e) {
         req.log.error({ e }, "kb_search failed");
@@ -322,6 +344,11 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
       const result = s.crisis
         ? { risk_level: "high", reason: "heuristic", confidence: 0.7 }
         : { risk_level: "none", reason: "none", confidence: 0.9 };
+      
+      // Update risk level in database
+      const riskLevel = s.crisis ? "high" : "none";
+      await callService.updateCall(callId, { riskLevel });
+      
       return res.send({ ok: true, result });
     }
 
@@ -338,27 +365,29 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
 
     const s = sessions.get(callId);
 
-    if (CFG.storeMetadata) {
-      const db = await getDb();
-      await db.collection("calls").updateOne(
-        { callId },
-        {
-          $set: {
-            endedAt: new Date(),
-            durationSeconds: Number(body.duration_s || 0) || null,
-            endReason: body.reason || body.end_reason || null,
-            tsStartRaw: body.ts_start ?? null,
-            lang: s?.lang ?? "en",
-            crisis_flag: !!s?.crisis,
-            kb_used: !!(s && s.kbUses > 0),
-            kb_count: s?.kbUses ?? 0,
-          },
-        },
-        { upsert: true }
-      );
+    // End the call with comprehensive data
+    try {
+      await callService.endCall(callId, {
+        endReason: body.reason || body.end_reason || "normal",
+        durationSeconds: Number(body.duration_s || 0) || undefined,
+        endedAt: new Date(),
+      });
+      
+      // Update final session data
+      if (s) {
+        await callService.updateCall(callId, {
+          lang: s.lang,
+          crisis_flag: s.crisis,
+          kb_used: s.kbUses > 0,
+          kb_count: s.kbUses,
+          turnCount: s.turnCount,
+        });
+      }
+    } catch (error) {
+      req.log.error({ error, callId }, "Failed to end call record");
     }
 
-    // Fallback: build chronological transcript even if end-of-call-report didn’t arrive
+    // Fallback: build chronological transcript even if end-of-call-report didn't arrive
     try { await buildAndStoreChronologicalTranscript(callId); } catch {}
 
     sessions.delete(callId);
@@ -445,6 +474,14 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
   app.post("/escalate", async (req, res) => {
     const body: any = req.body || {};
     const callId = body.callId;
+    const reason = body.reason || "crisis_detected";
+    
+    try {
+      await callService.escalateCall(callId, reason);
+    } catch (error) {
+      req.log.error({ error, callId }, "Failed to record escalation");
+    }
+    
     await vapi.escalate(callId, CFG.hotlineNumber);
     return res.send({ ok: true });
   });
@@ -615,6 +652,57 @@ export const registerVapiRoutes: FastifyPluginAsync = async (app) => {
 
     req.log.warn({ type, callId, raw }, "Unhandled Vapi webhook event");
     return res.send({ ok: true });
+  });
+
+  // -------------------------------
+  // Call management endpoints
+  // -------------------------------
+  app.get("/calls/metrics", async (req, res) => {
+    try {
+      const metrics = await callService.getCallMetrics();
+      return res.send(metrics);
+    } catch (error) {
+      req.log.error({ error }, "Failed to get call metrics");
+      return res.code(500).send({ error: "Failed to get metrics" });
+    }
+  });
+
+  app.get("/calls/recent", async (req, res) => {
+    try {
+      const limit = Number(req.query.limit) || 50;
+      const calls = await callService.getRecentCalls(limit);
+      return res.send({ calls });
+    } catch (error) {
+      req.log.error({ error }, "Failed to get recent calls");
+      return res.code(500).send({ error: "Failed to get calls" });
+    }
+  });
+
+  app.get("/calls/:callId", async (req, res) => {
+    try {
+      const callId = req.params.callId;
+      const call = await callService.getCall(callId);
+      if (!call) {
+        return res.code(404).send({ error: "Call not found" });
+      }
+      return res.send(call);
+    } catch (error) {
+      req.log.error({ error }, "Failed to get call");
+      return res.code(500).send({ error: "Failed to get call" });
+    }
+  });
+
+  app.post("/calls/:callId/remarks", async (req, res) => {
+    try {
+      const callId = req.params.callId;
+      const { remarks, tags } = req.body as { remarks: string; tags?: string[] };
+      
+      await callService.addRemarks(callId, remarks, tags);
+      return res.send({ ok: true });
+    } catch (error) {
+      req.log.error({ error }, "Failed to add remarks");
+      return res.code(500).send({ error: "Failed to add remarks" });
+    }
   });
 
   app.get("/vapi/last-event", async () => ({
